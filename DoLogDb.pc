@@ -1,0 +1,650 @@
+///////////////////////////////////////////////////////////////////////////////
+//Copyright (c) 2014 Ericsson
+//
+//The copyright in this work is vested in Ericsson Telekommunikation GmbH
+//(hereafter "Ericsson"). The information contained in this work (either in whole
+//or in part) is confidential and must not be modified, reproduced, disclosed or
+//disseminated to others or used for purposes other than that for which it is
+//supplied, without the prior written permission of Ericsson. If this work or any
+//part hereof is furnished to a third party by virtue of a contract with that
+//party, use of this work by such party shall be governed by the express
+//contractual terms between Ericsson, which is party to that contract and the
+//said party.
+//
+//The information in this document is subject to change without notice and
+//should not be construed as a commitment by Ericsson. Ericsson assumes no
+//responsibility for any errors that may appear in this document. With the
+//appearance of a new version of this document all older versions become
+//invalid.
+//
+//All rights reserved.
+//
+// Program    : BAT++ UNDOLOG
+// File       : DoLogDb.pc
+// Description: Implementation of the methods of DoLog class accessing the DB.
+//              The main table affected is UNDO_TRANSACTION_LOG.
+//              The XML is stored in LONG type attribute of the table.
+// Author(s)  : Norbert Bondarczuk
+// Created    : 2015-01-08
+// Abstract   : Implementation of the methods of DoLog class accessing the DB.
+//
+///////////////////////////////////////////////////////////////////////////////
+/*
+ * static char *SCCS_VERSION = "%I%";
+ */
+
+#include <string>
+#include <iostream>
+#include <map>
+#include <list>
+#include <stdexcept>
+#include <sstream>
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <oci.h>
+#include <sqlcpr.h>
+#include <sqlca.h>
+
+#include "DoLogTerminationHandler.hpp"
+#include "DoLogComponentController.hpp"
+#include "DoLogTrace.hpp"
+#include "DoLogSqlValue.hpp"
+#include "DoLog.hpp"
+#include "DoLogDb.hpp"
+
+EXEC SQL INCLUDE SQLCA;
+EXEC SQL INCLUDE ORACA;
+EXEC ORACLE OPTION( ORACA=YES );
+EXEC ORACLE OPTION( RELEASE_CURSOR=NO );
+EXEC ORACLE OPTION( SELECT_ERROR=YES );
+EXEC ORACLE OPTION( SQLCHECK=SYNTAX );
+
+using namespace std;
+
+namespace dolog
+{
+
+////////////////////////////////////////////////////////////////////////////////
+// LONG_VARCHAR;
+////////////////////////////////////////////////////////////////////////////////
+
+typedef struct
+{
+    ub4 len;
+    unsigned char buf[MAX_XML_SIZE];
+
+} LONG_VARCHAR;
+
+EXEC SQL TYPE LONG_VARCHAR is long varchar(MAX_XML_SIZE);
+
+////////////////////////////////////////////////////////////////////////////////
+// sqlErrorHandler
+////////////////////////////////////////////////////////////////////////////////
+
+static bool sqlErrorHandler (const struct sqlca* pSqlca,
+                             const char*         pFunctionName,
+                             const char*         pSqlText = NULL)
+{
+    TRACE(3, "sqlErrorHandler");
+
+    std::stringstream ss;
+    ss << pSqlca->sqlcode;
+
+    std::string labelFunctionName(pFunctionName);
+    std::string labelSqlCode(ss.str());
+    std::string labelMessage(pSqlca->sqlerrm.sqlerrmc);
+    std::string labelSqlText(pSqlText);
+
+    translate(labelMessage, "\n", "\t");
+
+    INFO("SQL error in function : " + labelFunctionName);
+    INFO("SQL return code       : " + labelSqlCode);
+    INFO("SQL error message     : " + labelMessage);
+    if (pSqlText != NULL)
+    {
+    INFO("SQL error statement   : " + labelSqlText + "\n");
+    }
+
+    return false;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::DbLongVarcharSelect
+// It selects an XML string from a DB table UNDO_TRANSACTION_LOG. The memory
+// is alocated only if the last recently used object size was smaller than the
+// buffer. This one may only grow.
+// Each XML block is parsed with XALANC DOM parser. The records with error
+// are marked by update of the ERRMSG and STATUS <- 'E' - Error. The correctly
+// parsed messages are inserted into the DoLog cache as they are ready to be applied
+// as UNDO operation.
+////////////////////////////////////////////////////////////////////////////////
+
+bool DoLog::dbLongVarcharSelect(int pSeqNo,
+                                int pImageLength)
+{
+    TRACE(3, "DoLog::dbLongVarcharSelect");
+
+    static int            sMaxImageLength = 0;
+    static unsigned char* sImageBuffer = NULL;
+    char*                 errmsg;
+    string                parsingStatus;
+
+    EXEC SQL BEGIN DECLARE SECTION;
+    char*                 oraDbHandle;
+    char                  oraStatus = 'P';
+    VARCHAR               oraErrmsg[MAX_ERRMSG_LEN + 1];
+    LONG_VARCHAR*         oraXmlString;
+    int                   oraSeqNo;
+    EXEC SQL END DECLARE SECTION;
+
+    oraDbHandle = mDbHandle;
+    TRACE_MSG(string(mDbHandle) + " - Selecting data from UNDO_TRANSACTION_LOG");
+
+    if (pImageLength > sMaxImageLength)
+    {
+        sImageBuffer = (unsigned char *)realloc (sImageBuffer, sizeof(ub4) + pImageLength);
+        if ((void *)sImageBuffer == NULL)
+        {
+            return ERROR("Unable allocate " + any2string(sizeof(ub4) + pImageLength) + " bytes");
+        }
+        else
+        {
+            sMaxImageLength = pImageLength;
+            TRACE_MSG("Allocated LONG memory buffer len: " + any2string(sMaxImageLength));
+        }
+    }
+    oraXmlString = (LONG_VARCHAR *)sImageBuffer;
+    oraXmlString->len = pImageLength;
+
+    oraSeqNo = pSeqNo;
+
+    TRACE_MSG("Selecting XML block");
+
+    EXEC SQL AT :oraDbHandle
+        SELECT XML_STRING
+        INTO   :oraXmlString
+        FROM   UNDO_TRANSACTION_LOG
+        WHERE  UNDO_TRANS_LOG_ID = :oraSeqNo;
+    if (sqlca.sqlcode != 0)
+    {
+        return sqlErrorHandler(&sqlca,
+                               "DoLog::dbLongVarcharSelect: SELECT XML",
+                               NULL);
+    }
+    else
+    {
+        parsingStatus = "P";
+        oraStatus = 'P';
+        oraErrmsg.arr[0] = '\0';
+        oraErrmsg.len = 0;
+
+        TRACE_MSG("Parsing XML string");
+
+        try
+        {
+            DoLog::getInstance()->xmlParse(oraXmlString->buf, oraXmlString->len);
+        }
+        catch(std::runtime_error &e)
+        {
+            parsingStatus = "E";
+            oraStatus = 'E';
+            errmsg = (char*)e.what();
+            snprintf((char *)oraErrmsg.arr, MAX_ERRMSG_LEN, "Error parsing XML: %s", errmsg);
+            oraErrmsg.len = strlen((char *)oraErrmsg.arr);
+        }
+        catch(...)
+        {
+            parsingStatus = "E";
+            oraStatus = 'E';
+            snprintf((char *)oraErrmsg.arr, MAX_ERRMSG_LEN, "%s", "Unknown exception while parsing XML");
+            oraErrmsg.len = strlen((char *)oraErrmsg.arr);
+        }
+
+        TRACE_MSG("Parsing XML string result: " + parsingStatus);
+    }
+
+    // mark the XML as Processed or Error
+
+    EXEC SQL AT :oraDbHandle
+        UPDATE UNDO_TRANSACTION_LOG
+        SET
+        STATUS      = :oraStatus,
+        ERRMSG      = :oraErrmsg,
+        MODIFY_DATE = SYSDATE
+        WHERE UNDO_TRANS_LOG_ID = :oraSeqNo;
+    if (sqlca.sqlcode != 0)
+    {
+        return sqlErrorHandler(&sqlca,
+                               "DoLog::dbLongVarcharSelect: UPDATE UNDO_TRANSACTION_LOG");
+
+    }
+    else
+    {
+        TRACE_MSG("Updated UNDO_TRANSACTION_LOG record SEQNO: " + any2string(oraSeqNo));
+    }
+
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::dbLongVarcharInsert
+// It inserts to the table UNDO_TRANSACTION_LOG a XML record with reference data.
+// It used the Oracle sequence to assure unique key constraint.
+////////////////////////////////////////////////////////////////////////////////
+
+bool DoLog::dbLongVarcharInsert(string &pImage,
+                                string &pDigest,
+                                string &pCustomerId,
+                                string &pBillSeqNo)
+{
+    TRACE(3, "DoLog::dbLongVarcharInsert");
+
+    int                   imageLength;
+    static int            sMaxImageLength = 0;
+    static unsigned char* sImageBuffer = NULL;
+
+    EXEC SQL BEGIN DECLARE SECTION;
+    char*                 oraDbHandle;
+    long                  oraSeqNo;
+    char                  oraLogType = 'U';
+    char                  oraStatus = 'C';
+    VARCHAR               oraDigest[MAX_DIGEST_LEN + 1];
+    int                   oraXmlSize;
+    VARCHAR               oraUserName[MAX_USERNAME_LEN + 1];
+    int                   oraAppProgramId;
+    LONG_VARCHAR*         oraXmlString;
+    int                   oraCustomerId;
+    int                   oraBillSeqNo;
+    short                 oraCustomerIdInd;
+    short                 oraBillSeqNoInd;
+    EXEC SQL END DECLARE SECTION;
+
+    oraDbHandle = mDbHandle;
+    TRACE_MSG(string(mDbHandle) + " - Inserting data to UNDO_TRANSACTION_LOG");
+
+    // get SEQ_NO
+
+    EXEC SQL  AT :oraDbHandle
+        SELECT MAX_UNDO_TRANS_LOG_ID_SEQ.NEXTVAL
+        INTO   :oraSeqNo
+        FROM   DUAL;
+    if (sqlca.sqlcode != 0)
+    {
+        return sqlErrorHandler(&sqlca,
+                               "DoLog::dbLongVarcharInsert: SELECT MAX_UNDO_TRANS_LOG_ID_SEQ.NEXTVAL");
+    }
+    else
+    {
+        TRACE_MSG("Got MAX_UNDO_TRANS_LOG_ID_SEQ.NEXTVAL: " + any2string(oraSeqNo));
+    }
+
+    // prepare LONG value
+
+    // XML_STRING
+    imageLength = pImage.length();
+    if (imageLength > sMaxImageLength)
+    {
+        sImageBuffer = (unsigned char *)realloc (sImageBuffer, sizeof(ub4) + imageLength);
+        if ((void *)sImageBuffer == NULL)
+        {
+            return ERROR("Unable allocate " + any2string(sizeof(ub4) + imageLength) + " bytes");
+        }
+        sMaxImageLength = imageLength;
+        TRACE_MSG("Allocated LONG memory buffer length: " + any2string(sMaxImageLength));
+    }
+    oraXmlString = (LONG_VARCHAR*)sImageBuffer;
+    memcpy((unsigned char *)oraXmlString->buf, pImage.c_str(), imageLength);
+    oraXmlString->len = imageLength;
+
+    // prepare rest of the attributes
+
+    // mandatory values
+
+    // XML_SIZE
+    oraXmlSize = imageLength;
+
+    // DIGEST
+    snprintf((char *)oraDigest.arr, MAX_DIGEST_LEN, "%s", pDigest.c_str());
+    oraDigest.len = strlen(pDigest.c_str());
+
+    // USERNAME
+    string userName = mDbUserName;
+    snprintf((char *)oraUserName.arr, MAX_USERNAME_LEN, "%s", userName.c_str());
+    oraUserName.len = strlen(userName.c_str());
+
+    // APP_PROGRAM_ID
+    oraAppProgramId = BCH_APP_PROGRAM_ID;
+
+    // optional, NULLable
+
+    // CUSTOMER_ID
+    if (!pCustomerId.empty())
+    {
+        oraCustomerId = any2int(pCustomerId);
+        if (oraCustomerId == -1)
+        {
+            return ERROR("Invalid CUSTOMER_ID parameter value: " + pCustomerId);
+        }
+        else
+        {
+            oraCustomerIdInd = 0;
+        }
+    }
+    else
+    {
+        oraCustomerIdInd = -1;
+    }
+
+    // BILLSEQNO
+    if (!pBillSeqNo.empty())
+    {
+        oraBillSeqNo = any2int(pBillSeqNo);
+        if (oraBillSeqNo == -1)
+        {
+            return ERROR("Invalid BILLSEQNO parameter value: " + pBillSeqNo);
+        }
+        else
+        {
+            oraBillSeqNoInd = 0;
+        }
+    }
+    else
+    {
+        oraBillSeqNoInd = -1;
+    }
+
+    // UNDO_TRANSACTION_LOG: Insert
+    TRACE_MSG("Inserting XML record of size: " + any2string(oraXmlString->len));
+    EXEC SQL  AT :oraDbHandle
+        INSERT INTO UNDO_TRANSACTION_LOG
+        (
+            UNDO_TRANS_LOG_ID,
+            LOG_TYPE,
+            STATUS,
+            BATCH_DIGEST,
+            CUSTOMER_ID,
+            BILLSEQNO,
+            XML_SIZE,
+            XML_STRING,
+            ENTRY_DATE,
+            USERNAME,
+            APP_PROGRAM_ID
+        )
+        VALUES
+        (
+            :oraSeqNo,
+            :oraLogType,
+            :oraStatus,
+            :oraDigest,
+            :oraCustomerId:oraCustomerIdInd,
+            :oraBillSeqNo:oraBillSeqNoInd,
+            :oraXmlSize,
+            :oraXmlString,
+            SYSDATE,
+            :oraUserName,
+            :oraAppProgramId
+        );
+    if (sqlca.sqlcode != 0)
+    {
+        return sqlErrorHandler(&sqlca,
+                               "DoLog::dbLongVarcharInsert: INSERT INTO UNDO_TRANSACTION_LOG");
+    }
+    else
+    {
+        TRACE_MSG("Inserted XML record of size: " + any2string(oraXmlString->len));
+    }
+
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::load
+// It loads the qualified XML records in STATUS = 'C' - Created and LOG_TYPE = 'U' - UNDO
+// The following access paths are avilable:
+// 1. For specific BILLSEQNO and CUSTOMER_ID
+// 2. For specifc BILLSEQNO
+// 2. All records (with specific types)
+////////////////////////////////////////////////////////////////////////////////
+
+bool DoLog::load(const int pBillSeqNo,
+                 const int pCustomerId)
+{
+    TRACE(2, "DoLog::load");
+
+    bool ok;
+
+    EXEC SQL BEGIN DECLARE SECTION;
+    char*   oraDbHandle;
+    VARCHAR oraDigest[MAX_DIGEST_LEN + 1];
+    int     oraSeqNo;
+    int     oraXmlSize;
+    char    oraStatus = 'C';
+    char    oraLogType = 'U';
+    int     oraBillSeqNo;
+    int     oraCustomerId;
+    EXEC SQL END DECLARE SECTION;
+
+    oraDbHandle = mDbHandle;
+    TRACE_MSG(string(mDbHandle) + " - Loading data from UNDO_TRANSACTION_LOG");
+
+    // declare cursor for entries with STATUS = 'C' - Created
+
+    if (pBillSeqNo > 0 && pCustomerId > 0)
+    {
+        oraBillSeqNo = pBillSeqNo;
+        oraCustomerId = pCustomerId;
+
+        EXEC SQL AT :oraDbHandle
+            DECLARE xmlCursor2 CURSOR FOR
+            SELECT UNDO_TRANS_LOG_ID,
+                   XML_SIZE
+            FROM   UNDO_TRANSACTION_LOG
+            WHERE  STATUS      = :oraStatus
+              AND  LOG_TYPE    = :oraLogType
+              AND  BILLSEQNO   = :oraBillSeqNo
+              AND  CUSTOMER_ID = :oraCustomerId
+            FOR UPDATE;
+
+        TRACE_MSG("Declared cursor on UNDO_TRANSACTION_LOG for: " + any2string(pBillSeqNo) + "/" + any2string(pCustomerId));
+    }
+    else if (pBillSeqNo > 0)
+    {
+        oraBillSeqNo = pBillSeqNo;
+
+        EXEC SQL AT :oraDbHandle
+            DECLARE xmlCursor1 CURSOR FOR
+            SELECT UNDO_TRANS_LOG_ID,
+                   XML_SIZE
+            FROM   UNDO_TRANSACTION_LOG
+            WHERE  STATUS    = :oraStatus
+              AND  LOG_TYPE  = :oraLogType
+              AND  BILLSEQNO = :oraBillSeqNo
+            FOR UPDATE;
+
+        TRACE_MSG("Declared cursor on UNDO_TRANSACTION_LOG for: " + any2string(pBillSeqNo));
+    }
+    else
+    {
+        EXEC SQL AT :oraDbHandle
+            DECLARE xmlCursor0 CURSOR FOR
+            SELECT UNDO_TRANS_LOG_ID,
+                   XML_SIZE
+            FROM   UNDO_TRANSACTION_LOG
+            WHERE  STATUS   = :oraStatus
+            AND    LOG_TYPE = :oraLogType
+            FOR UPDATE;
+
+        TRACE_MSG("Declared cursor");
+    }
+
+    if (sqlca.sqlcode != 0)
+    {
+        return sqlErrorHandler(&sqlca,
+                               "DoLog::load: DECLARE CURSOR UNDO_TRANSACTION_LOG");
+    }
+
+    // OPEN cursor
+
+    if (pBillSeqNo > 0 && pCustomerId > 0)
+    {
+        EXEC SQL AT :oraDbHandle
+            OPEN xmlCursor2;
+    }
+    else if (pBillSeqNo > 0)
+    {
+        EXEC SQL AT :oraDbHandle
+            OPEN xmlCursor1;
+    }
+    else
+    {
+        EXEC SQL AT :oraDbHandle
+            OPEN xmlCursor0;
+    }
+    if (sqlca.sqlcode != 0)
+    {
+        return sqlErrorHandler(&sqlca,"DoLog::load: OPEN CURSOR UNDO_TRANSACTION_LOG");
+    }
+    else
+    {
+        TRACE_MSG("Opened cursor on UNDO_TRANSACTION_LOG");
+    }
+
+    // for each qualified record in STATUS = 'C'
+
+    do {
+        // fetch a record to be processed
+        TRACE_MSG("Fetch from cursor");
+        if (pBillSeqNo > 0 && pCustomerId > 0)
+        {
+            EXEC SQL AT :oraDbHandle
+                FETCH xmlCursor2
+                INTO :oraSeqNo,
+                     :oraXmlSize;
+        }
+        else if (pBillSeqNo > 0)
+        {
+            EXEC SQL AT :oraDbHandle
+                FETCH xmlCursor1
+                INTO :oraSeqNo,
+                     :oraXmlSize;
+        }
+        else
+        {
+            EXEC SQL AT :oraDbHandle
+                FETCH xmlCursor0
+                INTO :oraSeqNo,
+                     :oraXmlSize;
+        }
+
+        if (sqlca.sqlcode != 0 && sqlca.sqlcode != NOT_FOUND)
+        {
+            return sqlErrorHandler(&sqlca, "DoLog::load: FETCH CURSOR UNDO_TRANSACTION_LOG");
+        }
+        else if (sqlca.sqlcode != NOT_FOUND)
+        {
+            // get the XML_STRING value
+            TRACE_MSG("Fetched record for SEQNO: " + any2string(oraSeqNo));
+            ok = dbLongVarcharSelect(oraSeqNo, oraXmlSize);
+            if (!ok)
+            {
+                return ERROR("Error loading XML record SEQNO " + any2string(oraSeqNo));
+            }
+            else
+            {
+                TRACE_MSG("Processed XML record SEQNO: " + any2string(oraSeqNo));
+            }
+        }
+
+    } while (sqlca.sqlcode == 0);
+
+    // close cursor
+
+    if (pBillSeqNo > 0 && pCustomerId > 0)
+    {
+        EXEC SQL AT :oraDbHandle
+            CLOSE xmlCursor2;
+    }
+    else if (pBillSeqNo > 0)
+    {
+        EXEC SQL AT :oraDbHandle
+            CLOSE xmlCursor1;
+    }
+    else
+    {
+        EXEC SQL AT :oraDbHandle
+            CLOSE xmlCursor0;
+    }
+
+    if (sqlca.sqlcode != 0)
+    {
+        return sqlErrorHandler(&sqlca, "DoLog::load: CLOSE CURSOR UNDO_TRANSACTION_LOG");
+    }
+    else
+    {
+        TRACE_MSG("Closed cursor");
+    }
+
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::sqlApply
+////////////////////////////////////////////////////////////////////////////////
+
+bool DoLog::sqlStatementApply(const string& pSqlText)
+{
+    TRACE(2, "DoLog::sqlStatementApply");
+
+    EXEC SQL BEGIN DECLARE SECTION;
+    char* oraDbHandle;
+    char* oraSqlText;
+    EXEC SQL END DECLARE SECTION;
+
+    oraDbHandle = mDbHandle;
+
+    TRACE_MSG(string(mDbHandle) + " - Executing SQL: " + pSqlText);
+
+    oraSqlText = (char *)pSqlText.c_str();
+
+    EXEC SQL AT :oraDbHandle
+        EXECUTE IMMEDIATE :oraSqlText;
+    if (sqlca.sqlcode != 0)
+    {
+        return sqlErrorHandler(&sqlca,
+                               "DoLog::sqlStatementApply: EXECUTE IMMEDIATE",
+                               oraSqlText);
+    }
+
+    TRACE_MSG("Executed");
+
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DoLog::sqlTextApplyAll
+////////////////////////////////////////////////////////////////////////////////
+
+bool DoLog::sqlStatementApplyAll(vector<string>& pSqlTextVec)
+{
+    TRACE(2, "DoLog::sqlStatementApplyAll");
+
+    bool ok;
+
+    for (vector<string>::const_iterator it = pSqlTextVec.begin(); it < pSqlTextVec.end(); ++it)
+    {
+        string sqlText = *it;
+        ok = sqlStatementApply(sqlText);
+        if (!ok)
+        {
+            return ERROR("Error executing SQL: " + sqlText);
+        }
+    }
+
+    return true;
+}
+
+
+}
